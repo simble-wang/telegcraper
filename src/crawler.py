@@ -9,6 +9,8 @@ import os
 from datetime import datetime, timezone
 import socks
 import time
+from src.data_processor import DataProcessor
+from src.download_manager import DownloadManager
 
 class TelegramCrawler:
     def __init__(self, api_id, api_hash, download_path="downloads", proxy=None):
@@ -28,6 +30,8 @@ class TelegramCrawler:
         self.max_retries = 3  # 最大重试次数
         self.retry_delay = 5  # 重试延迟（秒）
         self.users_cache = {}  # 添加用户信息缓存
+        self.data_processor = DataProcessor()
+        self.download_manager = DownloadManager(download_path)
         
     def ensure_download_path(self):
         """确保下载目录存在"""
@@ -46,23 +50,107 @@ class TelegramCrawler:
             return 'audio'
         return None
         
+    async def _download_media_with_retry(self, message, max_retries=3):
+        """带重试机制的媒体下载"""
+        for attempt in range(max_retries):
+            try:
+                return await self._download_media(message)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"下载失败，{attempt + 1}/{max_retries} 次尝试: {str(e)}")
+                    await asyncio.sleep(2 * (attempt + 1))  # 指数退避
+                else:
+                    print(f"下载失败，已达到最大重试次数: {str(e)}")
+                    return None
+
     async def _download_media(self, message):
         """下载媒体文件"""
         if not message.media:
             return None
             
         try:
-            # 生成唯一文件名
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{timestamp}_{message.id}"
+            # 获取媒体信息
+            media_type = self._get_media_type(message)
+            file_size = 0
             
-            # 下载到指定目录
-            path = await message.download_media(
-                file=os.path.join(self.download_path, filename)
+            if hasattr(message.media, 'document'):
+                file_size = message.media.document.size
+            elif hasattr(message.media, 'photo'):
+                sizes = message.media.photo.sizes
+                largest_size = max(sizes, key=lambda x: getattr(x, 'size', 0) if hasattr(x, 'size') else 0)
+                file_size = getattr(largest_size, 'size', 0)
+                
+            # 生成文件ID
+            file_id = self.download_manager.generate_file_id(message.id, media_type, file_size)
+            
+            # 检查是否已下载
+            if self.download_manager.is_file_completed(file_id, file_size):
+                file_path = self.download_manager.download_records[file_id]['file_path']
+                print(f"文件已存在且完整，跳过下载: {os.path.basename(file_path)}")
+                return file_path
+                
+            # 获取保存路径
+            original_name = getattr(message.media, 'filename', '')
+            file_path = self.download_manager.get_file_path(file_id, original_name)
+            
+            # 创建进度回调
+            last_update = [0]
+            start_time = [time.time()]
+            
+            async def progress_callback(received, total):
+                if total:
+                    now = time.time()
+                    if now - last_update[0] >= 0.5:
+                        percentage = (received / total) * 100
+                        speed = received / (now - start_time[0]) / 1024
+                        
+                        if self.download_progress_callback:
+                            self.download_progress_callback(
+                                message.id,
+                                percentage,
+                                speed,
+                                media_type,
+                                os.path.basename(file_path),
+                                received,
+                                total
+                            )
+                        last_update[0] = now
+                        
+            # 下载文件
+            downloaded_path = await message.download_media(
+                file=file_path,
+                progress_callback=progress_callback
             )
-            return path
+            
+            # 验证下载是否成功
+            if downloaded_path and os.path.exists(downloaded_path):
+                actual_size = os.path.getsize(downloaded_path)
+                if actual_size == file_size:
+                    # 添加下载记录
+                    self.download_manager.add_download_record(file_id, downloaded_path, file_size)
+                    
+                    # 发送100%进度
+                    if self.download_progress_callback:
+                        self.download_progress_callback(
+                            message.id,
+                            100.0,
+                            0,
+                            media_type,
+                            os.path.basename(file_path),
+                            file_size,
+                            file_size
+                        )
+                    return downloaded_path
+                else:
+                    # 下载不完整，删除文件和记录
+                    self.download_manager.remove_download_record(file_id)
+                    print(f"文件下载不完整，将重试: {os.path.basename(file_path)}")
+                    return None
+                    
         except Exception as e:
             print(f"下载媒体文件失败: {str(e)}")
+            if 'file_id' in locals():
+                self.download_manager.remove_download_record(file_id)
             return None
             
     async def _process_group_id(self, group_id):
@@ -124,25 +212,38 @@ class TelegramCrawler:
         try:
             user = await self.client.get_entity(user_id)
             user_info = {
-                'username': user.username or '',
-                'first_name': user.first_name or '',
-                'last_name': user.last_name or ''
+                'username': getattr(user, 'username', ''),
+                'first_name': '',
+                'last_name': '',
+                'display_name': ''
             }
-            # 生成显示名称
-            if user.username:
-                user_info['display_name'] = f"@{user.username}"
-            else:
-                full_name = ' '.join(filter(None, [user.first_name, user.last_name]))
-                user_info['display_name'] = full_name or f"User{user_id}"
-                
+            
+            # 处理不同类型的发送者
+            if hasattr(user, 'title'):  # 如果是频道或群组
+                user_info['display_name'] = user.title
+            else:  # 如果是用户
+                user_info['first_name'] = getattr(user, 'first_name', '')
+                user_info['last_name'] = getattr(user, 'last_name', '')
+                if user.username:
+                    user_info['display_name'] = f"@{user.username}"
+                else:
+                    full_name = ' '.join(filter(None, [user_info['first_name'], user_info['last_name']]))
+                    user_info['display_name'] = full_name or f"User{user_id}"
+                    
             self.users_cache[user_id] = user_info
             return user_info
         except Exception as e:
-            print(f"获取用户 {user_id} 信息失败: {str(e)}")
-            return {'username': '', 'first_name': '', 'last_name': '', 'display_name': f"User{user_id}"}
+            print(f"获取发送者 {user_id} 信息失败: {str(e)}")
+            return {
+                'username': '',
+                'first_name': '',
+                'last_name': '',
+                'display_name': f"Unknown{user_id}"
+            }
             
-    async def start_crawling(self, group_id, start_date, progress_callback=None, limit=None):
+    async def start_crawling(self, group_id, start_date, progress_callback=None, download_progress_callback=None, limit=None, resume=False):
         """开始爬取消息"""
+        self.download_progress_callback = download_progress_callback
         try:
             # 初始化客户端
             print(f"使用代理配置: {self.proxy}")
@@ -210,82 +311,136 @@ class TelegramCrawler:
             # 初始化消息列表
             self.messages = []
             
-            # 先获取指定时间之前的消息数量
+            # 将输入的时间转换为带时区的时间
+            if start_date and start_date.tzinfo is None:
+                start_date = start_date.replace(tzinfo=timezone.utc)
+            
+            # 检查是否有上次的进度
+            progress_info = None
+            last_message_id = None
+            if resume:
+                progress_data = self.data_processor.load_progress(group_id)
+                if progress_data:
+                    progress_info, self.messages = progress_data
+                    if progress_info and 'last_message_id' in progress_info:
+                        last_message_id = progress_info['last_message_id']
+                    print(f"找到上次进度：已爬取 {len(self.messages)} 条消息")
+                    
+            # 获取消息
             try:
                 total_messages = 0
                 found_start_date = False
                 temp_messages = []
                 
-                # 将输入的时间转换为带时区的时间
-                if start_date.tzinfo is None:
-                    start_date = start_date.replace(tzinfo=timezone.utc)
-                
-                print(f"正在定位 {start_date} 之前的消息...")
-                async for message in self.client.iter_messages(entity):
-                    # 确保消息时间也是带时区的
-                    message_date = message.date
-                    if message_date.tzinfo is None:
-                        message_date = message_date.replace(tzinfo=timezone.utc)
+                print(f"正在定位消息...")
+                kwargs = {}
+                if start_date:
+                    kwargs['offset_date'] = start_date
+                if last_message_id:
+                    kwargs['offset_id'] = last_message_id
                     
-                    if message_date <= start_date:
+                async for message in self.client.iter_messages(entity, **kwargs):
+                    # 如果没有指定起始时间，直接收集消息
+                    if not start_date:
                         found_start_date = True
                         temp_messages.append(message)
                         total_messages += 1
-                        if progress_callback:
-                            progress_callback(0, f"正在统计起始时间前的消息: {total_messages}")
+                    else:
+                        # 确保消息时间也是带时区的
+                        message_date = message.date
+                        if message_date.tzinfo is None:
+                            message_date = message_date.replace(tzinfo=timezone.utc)
                         
-                        # 如果设置了数量限制，达到后就停止
-                        if limit and total_messages >= limit:
-                            break
-                            
-                if not found_start_date:
-                    raise Exception("未找到指定时间之前的消息")
+                        if message_date <= start_date:
+                            found_start_date = True
+                            temp_messages.append(message)
+                            total_messages += 1
                     
+                    if progress_callback:
+                        progress_callback(0, f"正在统计消息: {total_messages}")
+                    
+                    # 如果设置了数量限制，达到后就停止
+                    if limit and total_messages >= limit:
+                        break
+                        
                 if total_messages == 0:
                     raise Exception("未找到符合条件的消息")
                     
                 # 显示实际要爬取的消息数量
                 actual_limit = min(limit, total_messages) if limit else total_messages
-                print(f"找到 {start_date} 之前的 {actual_limit} 条消息")
+                print(f"找到 {actual_limit} 条消息")
                 
                 # 处理已获取的消息
                 processed_messages = 0
                 for message in temp_messages[:actual_limit]:
-                    # 获取发送者信息
-                    user_info = await self._get_user_info(message.sender_id)
-                    
-                    # 确保消息时间带有时区信息
-                    message_date = message.date
-                    if message_date.tzinfo is None:
-                        message_date = message_date.replace(tzinfo=timezone.utc)
-                    
-                    message_data = {
-                        'group': group_id,
-                        'sender_id': message.sender_id,
-                        'username': user_info['username'],
-                        'sender_name': user_info['display_name'],
-                        'date': message_date,
-                        'text': message.text,
-                        'views': getattr(message, 'views', 0),
-                        'media_type': self._get_media_type(message),
-                        'media_path': await self._download_media(message) if message.media else None
-                    }
-                    self.messages.append(message_data)
-                    
-                    # 更新进度
-                    processed_messages += 1
-                    if progress_callback:
-                        progress = (processed_messages / actual_limit) * 100
-                        progress_callback(progress, f"已处理 {processed_messages}/{actual_limit} 条消息")
+                    try:
+                        # 获取发送者信息
+                        user_info = await self._get_user_info(message.sender_id)
                         
-                    # 每处理10条消息暂停一下，避免请求过于频繁
-                    if processed_messages % 10 == 0:
-                        await asyncio.sleep(0.5)
+                        # 更新消息处理进度
+                        if progress_callback:
+                            progress = (processed_messages / actual_limit) * 100
+                            status_text = (
+                                f"正在处理消息 {processed_messages + 1}/{actual_limit}\n"
+                                f"发送者: {user_info['display_name']}\n"
+                                f"时间: {message.date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"类型: {'含媒体文件' if message.media else '纯文本'}"
+                            )
+                            progress_callback(progress, status_text)
                         
+                        # 确保消息时间带有时区信息
+                        message_date = message.date
+                        if message_date.tzinfo is None:
+                            message_date = message_date.replace(tzinfo=timezone.utc)
+                        
+                        message_data = {
+                            'id': message.id,
+                            'group': group_id,
+                            'sender_id': message.sender_id,
+                            'username': user_info['username'],
+                            'sender_name': user_info['display_name'],
+                            'date': message_date,
+                            'text': message.text or '',
+                            'views': getattr(message, 'views', 0),
+                            'media_type': self._get_media_type(message),
+                            'media_path': await self._download_media_with_retry(message) if message.media else None
+                        }
+                        self.messages.append(message_data)
+                        
+                        # 更新进度
+                        processed_messages += 1
+                        if progress_callback:
+                            progress = (processed_messages / actual_limit) * 100
+                            progress_callback(progress, f"已处理 {processed_messages}/{actual_limit} 条消息")
+                            
+                        # 每处理10条消息暂停一下，避免请求过于频繁
+                        if processed_messages % 10 == 0:
+                            await asyncio.sleep(0.5)
+                            
+                        # 定期保存进度
+                        if processed_messages % 100 == 0:
+                            self.data_processor.save_progress(
+                                group_id,
+                                self.messages,
+                                last_message_id=message.id,
+                                start_date=start_date
+                            )
+                    except Exception as e:
+                        print(f"处理消息 {message.id} 时出错: {str(e)}")
+                        continue
+                
             except FloodWaitError as e:
                 raise Exception(f"请求过于频繁，需要等待 {e.seconds} 秒")
             except Exception as e:
-                raise Exception(f"爬取消息时出错: {str(e)}")
+                # 发生错误时保存进度
+                if self.messages:
+                    self.data_processor.save_progress(
+                        group_id,
+                        self.messages,
+                        last_message_id=last_message_id,
+                        start_date=start_date
+                    )
+                raise e
                 
         except Exception as e:
             raise Exception(f"爬取失败: {str(e)}")

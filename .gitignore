@@ -19,17 +19,24 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
-.venv/
-venv/
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Project specific
+config.json
+download_records.json
+data/
+downloads/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# Project specific
-downloads/
-*.session
-*.session-journal
-config.json 
+# OS
+.DS_Store
+Thumbs.db 

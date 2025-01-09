@@ -8,18 +8,19 @@ import sys
 import pandas as pd
 from datetime import datetime
 import asyncio
-from crawler import TelegramCrawler
-from config_manager import ConfigManager
-from proxy_dialog import ProxyDialog
-from auth_dialog import PhoneInputDialog, CodeInputDialog
-from message_detail_dialog import MessageDetailDialog
+from src.crawler import TelegramCrawler
+from src.config_manager import ConfigManager
+from src.proxy_dialog import ProxyDialog
+from src.auth_dialog import PhoneInputDialog, CodeInputDialog
+from src.message_detail_dialog import MessageDetailDialog
 
 class CrawlerThread(QThread):
     progress_updated = pyqtSignal(float, str)
+    media_progress_updated = pyqtSignal(int, float, float, str, str, int, int)  # message_id, percentage, speed, media_type, filename, received, total
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
     
-    def __init__(self, api_id, api_hash, group_id, start_date, proxy_config=None, limit=None):
+    def __init__(self, api_id, api_hash, group_id, start_date, proxy_config=None, limit=None, resume=False):
         super().__init__()
         self.api_id = api_id
         self.api_hash = api_hash
@@ -27,6 +28,7 @@ class CrawlerThread(QThread):
         self.start_date = start_date
         self.proxy_config = proxy_config
         self.limit = limit
+        self.resume = resume
         
         # 创建爬虫实例
         try:
@@ -44,13 +46,19 @@ class CrawlerThread(QThread):
             asyncio.set_event_loop(loop)
             
             try:
+                # 定义媒体下载进度回调
+                def media_progress_callback(message_id, percentage, speed, media_type, filename, received, total):
+                    self.media_progress_updated.emit(message_id, percentage, speed, media_type, filename, received, total)
+                
                 # 运行爬虫
                 loop.run_until_complete(
                     self.crawler.start_crawling(
                         self.group_id,
                         self.start_date,
                         lambda p, m: self.progress_updated.emit(p, m),
-                        limit=self.limit
+                        media_progress_callback,  # 传递媒体下载进度回调
+                        limit=self.limit,
+                        resume=self.resume
                     )
                 )
                 
@@ -160,14 +168,22 @@ class MainWindow(QMainWindow):
         progress_group = QGroupBox("进度")
         progress_layout = QVBoxLayout()
         
-        # 进度条
+        # 总体进度
+        progress_label = QLabel("总体进度:")
         self.progress_bar = QProgressBar()
+        progress_layout.addWidget(progress_label)
         progress_layout.addWidget(self.progress_bar)
+        
+        # 媒体下载进度
+        media_progress_label = QLabel("媒体下载进度:")
+        self.media_progress_bar = QProgressBar()
+        progress_layout.addWidget(media_progress_label)
+        progress_layout.addWidget(self.media_progress_bar)
         
         # 状态信息
         self.status_text = QTextEdit()
         self.status_text.setReadOnly(True)
-        self.status_text.setMaximumHeight(100)
+        self.status_text.setMaximumHeight(150)
         progress_layout.addWidget(self.status_text)
         
         progress_group.setLayout(progress_layout)
@@ -215,6 +231,11 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_crawling)
         action_layout.addWidget(self.start_button)
         
+        # 继续上次采集按钮
+        self.resume_button = QPushButton("继续上次采集")
+        self.resume_button.clicked.connect(lambda: self.start_crawling(resume=True))
+        action_layout.addWidget(self.resume_button)
+        
         # 导出按钮
         self.export_button = QPushButton("导出Excel")
         self.export_button.clicked.connect(self.export_data)
@@ -223,7 +244,7 @@ class MainWindow(QMainWindow):
         
         self.main_layout.addLayout(action_layout)
 
-    def start_crawling(self):
+    def start_crawling(self, resume=False):
         # 获取输入值
         api_id = self.api_id_input.text().strip()
         api_hash = self.api_hash_input.text().strip()
@@ -255,46 +276,81 @@ class MainWindow(QMainWindow):
             self.status_text.setText("API ID必须是数字")
             return
             
-        # 禁用按钮
-        self.start_button.setEnabled(False)
-        self.export_button.setEnabled(False)
-        
-        # 重置进度条
-        self.progress_bar.setValue(0)
-        self.status_text.setText("正在初始化...")
-        
         # 创建并启动爬虫线程
         self.crawler_thread = CrawlerThread(
             api_id, api_hash, group_id, start_date, 
             proxy_config=getattr(self, 'proxy_config', None),
-            limit=limit
+            limit=limit,
+            resume=resume
         )
         
-        # 设置验证回调
-        async def phone_code_callback():
-            dialog = PhoneInputDialog(self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                return dialog.phone_input.text()
-            return None
-            
-        async def code_callback():
-            dialog = CodeInputDialog(self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                return dialog.code_input.text()
-            return None
-            
-        self.crawler_thread.crawler.phone_code_callback = phone_code_callback
-        self.crawler_thread.crawler.code_callback = code_callback
-        
+        # 连接所有信号
         self.crawler_thread.progress_updated.connect(self.update_progress)
+        self.crawler_thread.media_progress_updated.connect(self.update_media_progress)
         self.crawler_thread.finished.connect(self.crawling_finished)
         self.crawler_thread.error.connect(self.crawling_error)
+        
+        # 禁用按钮
+        self.start_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        
+        # 启动线程
         self.crawler_thread.start()
         
     def update_progress(self, progress, message):
         self.progress_bar.setValue(int(progress))
-        self.status_text.setText(message)
+        current_text = self.status_text.toPlainText()
+        lines = current_text.split('\n')
+        # 保持最多显示10行
+        if len(lines) > 10:
+            lines = lines[1:]
+        lines.append(message)
+        self.status_text.setText('\n'.join(lines))
+        # 滚动到底部
+        self.status_text.verticalScrollBar().setValue(
+            self.status_text.verticalScrollBar().maximum()
+        )
+
+    def update_media_progress(self, message_id, percentage, speed, media_type, filename, received, total):
+        """更新媒体下载进度"""
+        self.media_progress_bar.setValue(int(percentage))
         
+        # 格式化显示信息
+        media_type_names = {
+            'photo': '图片',
+            'video': '视频',
+            'audio': '音频',
+            'document': '文档'
+        }
+        
+        media_type_display = media_type_names.get(media_type, media_type)
+        status = (
+            f"正在下载{media_type_display}文件:\n"
+            f"文件名: {filename}\n"
+            f"进度: {percentage:.1f}% ({self.format_size(received)}/{self.format_size(total)})\n"
+            f"速度: {speed:.1f} KB/s"
+        )
+        
+        # 更新状态文本
+        current_text = self.status_text.toPlainText()
+        lines = current_text.split('\n')
+        # 如果有超过4行的媒体下载信息，删除旧的
+        if len(lines) > 4:
+            lines = lines[:4]
+        lines.append(status)
+        self.status_text.setText('\n'.join(lines))
+        self.status_text.verticalScrollBar().setValue(
+            self.status_text.verticalScrollBar().maximum()
+        )
+
+    def format_size(self, size):
+        """格式化文件大小显示"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
     def crawling_finished(self, messages):
         self.messages = messages
         self.status_text.setText("爬取完成!")
@@ -438,20 +494,34 @@ class MainWindow(QMainWindow):
         """加载保存的配置"""
         config = self.config_manager.load_config()
         if config:
-            self.api_id_input.setText(config['api_id'])
+            self.api_id_input.setText(str(config['api_id']))
             self.api_hash_input.setText(config['api_hash'])
             self.group_id_input.setText(config['group_id'])
             
-    def closeEvent(self, event):
-        """窗口关闭时保存配置"""
+            # 加载代理配置
+            if 'proxy_config' in config and config['proxy_config']:
+                self.proxy_config = config['proxy_config']
+                print("已加载代理配置")
+
+    def save_current_config(self):
+        """保存当前配置"""
         api_id = self.api_id_input.text().strip()
         api_hash = self.api_hash_input.text().strip()
         group_id = self.group_id_input.text().strip()
         
         if all([api_id, api_hash, group_id]):
-            self.config_manager.save_config(api_id, api_hash, group_id)
-            
-        event.accept() 
+            self.config_manager.save_config(
+                api_id, 
+                api_hash, 
+                group_id,
+                getattr(self, 'proxy_config', None)
+            )
+            print("配置已保存")
+
+    def closeEvent(self, event):
+        """窗口关闭时保存配置"""
+        self.save_current_config()
+        event.accept()
 
     def show_proxy_settings(self):
         """显示代理设置对话框"""
@@ -461,18 +531,6 @@ class MainWindow(QMainWindow):
             # 保存配置
             self.save_current_config()
             
-    def save_current_config(self):
-        """保存当前配置"""
-        api_id = self.api_id_input.text().strip()
-        api_hash = self.api_hash_input.text().strip()
-        group_id = self.group_id_input.text().strip()
-        
-        if all([api_id, api_hash, group_id]):
-            self.config_manager.save_config(
-                api_id, api_hash, group_id,
-                getattr(self, 'proxy_config', None)
-            ) 
-
     def show_message_detail(self, item):
         """显示消息详情"""
         message = item.data(Qt.ItemDataRole.UserRole)
