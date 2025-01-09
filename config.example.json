@@ -1,0 +1,11 @@
+{
+    "api_id": "your_api_id_here",
+    "api_hash": "your_api_hash_here",
+    "group_id": "example_group_id",
+    "proxy_config": {
+        "proxy_type": "SOCKS5",
+        "addr": "127.0.0.1",
+        "port": 3067,
+        "rdns": true
+    }
+} 

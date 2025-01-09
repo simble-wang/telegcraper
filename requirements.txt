@@ -1,0 +1,4 @@
+PyQt6>=6.4.0
+telethon>=1.28.5
+pandas>=1.5.3
+PySocks>=1.7.1 
